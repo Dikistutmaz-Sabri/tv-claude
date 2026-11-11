@@ -184,6 +184,8 @@ def record_usage(u, text: str, ms: int) -> None:
 
 def ask_claude(text: str) -> dict:
     global history, history_at
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        return {"say": "API anahtarı henüz girilmemiş.", "actions": []}
     if usage_today["day"] == date.today().isoformat() and usage_today["tokens"] > DAILY_TOKEN_LIMIT:
         return {"say": "Bugünkü kullanım sınırına ulaşıldı.", "actions": []}
     with lock:
@@ -293,6 +295,9 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def warm_up() -> None:
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        log.warning("ANTHROPIC_API_KEY boş; yalnızca hızlı yol çalışır")
+        return
     try:
         client.models.retrieve(MODEL)
         log.info("API bağlantısı hazır (%s)", MODEL)
