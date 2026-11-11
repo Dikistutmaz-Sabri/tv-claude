@@ -1,0 +1,12 @@
+.env
+.venv/
+__pycache__/
+apps.json
+usage.jsonl
+*.p12
+*.jks
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+.keystore_pass
