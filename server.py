@@ -134,8 +134,9 @@ def fast_path(text: str) -> dict | None:
 SYSTEM = """Sen bir Android TV kutusunun sesli asistanısın. Kullanıcı Türkçe konuşur, sesi yazıya çevrilmiş olarak gelir (yazım hataları olabilir).
 Görevin: isteği anla, gerekirse `tv` aracını TEK SEFERDE çağır ve `say` alanına TV'nin sesli okuyacağı kısa Türkçe cevabı yaz.
 Kurallar:
-- TV'de bir işlem gerekiyorsa mutlaka `tv` aracını çağır; işlem yoksa (soru, sohbet) araç çağırma, düz metinle cevap ver.
-- Cevaplar sesli okunur: en fazla 2 kısa cümle, liste, emoji, markdown yok.
+- Her zaman `tv` aracını çağır. İşlem yoksa (soru, sohbet) `actions` boş liste olsun, cevabı `say` alanına yaz.
+- `say` doğrudan sesli okunur: yalnızca kullanıcıya söylenecek söz; düşünce, açıklama, liste, emoji, markdown yok.
+- `say` en fazla 2 kısa cümle (200 karakteri geçme).
 - İşlem için onay cümlesi gerekmez; `say` boş bırakılabilir. Belirsizse en olası işlemi yap.
 - Uygulama açarken yalnızca aşağıdaki listedeki paket adlarını kullan. Listede yoksa bunu söyle.
 - TV'yi, televizyonu, kutuyu, box'ı, Android'i kapatma ya da beklemeye/uyku moduna alma istekleri `sleep` işlemidir.
@@ -194,6 +195,19 @@ def record_usage(u, text: str, ms: int) -> None:
         }) + "\n")
 
 
+def shorten(say: str, limit: int = 220) -> str:
+    """Sesli okuma uzamasın: cümle sınırında en fazla `limit` karakter."""
+    say = " ".join(say.split())
+    if len(say) <= limit:
+        return say
+    out = ""
+    for sent in re.split(r"(?<=[.!?])\s+", say):
+        if out and len(out) + len(sent) + 1 > limit:
+            break
+        out = f"{out} {sent}".strip()
+    return out[:limit]
+
+
 def ask_claude(text: str) -> dict:
     global history, history_at
     if not os.environ.get("ANTHROPIC_API_KEY"):
@@ -212,7 +226,7 @@ def ask_claude(text: str) -> dict:
                 max_tokens=600,
                 system=SYSTEM.format(apps=app_lines or "- (liste henüz gelmedi)"),
                 tools=[TV_TOOL],
-                tool_choice={"type": "auto"},
+                tool_choice={"type": "tool", "name": "tv"},
                 thinking={"type": "disabled"},
                 output_config={"effort": "low"},
                 cache_control={"type": "ephemeral"},
@@ -241,6 +255,7 @@ def ask_claude(text: str) -> dict:
                 actions = [a for a in raw if isinstance(a, dict) and a.get("type") in VALID and VALID[a["type"]](a)]
             elif block.type == "text" and block.text.strip():
                 say = say or block.text.strip()
+        say = shorten(say)
         history = messages + [{"role": "assistant", "content": say or "Tamam."}]
         history_at = time.time()
         log.info("claude %dms in=%s out=%s -> %s %s", ms, resp.usage.input_tokens, resp.usage.output_tokens, say, actions)
