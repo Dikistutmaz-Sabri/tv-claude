@@ -85,11 +85,18 @@ def steps_in(t: str, default: int) -> int:
     return default
 
 
+# "kapat", "box'ı kapat", "android'i kapat", "televizyonu kapat", "TV box'u kapat", "stand by'a al"...
+_DEVICE = r"(tv ?box|tv ?boks|tivi ?box|box|boks|kutu|android( tv)?|tv|tivi|televizyon|cihaz|ekran)( ?(u|ü|ı|i|yu|yü|yı|yi|nu|nü))?"
+_OFF = (r"(kapat|kapa|kapan|kapansın|kapatır mısın|kapat lütfen|lütfen kapat|uyut|"
+        r"(beklemeye|bekleme moduna|uyku moduna|stand ?by( a)?|standby( a)?) (al|geç))")
+SLEEP_RE = re.compile(rf"(({_DEVICE} )?{_OFF}|her şeyi kapat|stand ?by|standby|uyku modu|bekleme modu)")
+
+
 def fast_path(text: str) -> dict | None:
     t = norm(text)
     if not t:
         return None
-    if re.fullmatch(r"(sesi |ses )?(kapat|sessize al|sustur|sessiz)( ses)?", t) or t in {"sesi kapat", "sessize al"}:
+    if re.fullmatch(r"(sesi? )?(sessize al|sustur|sessiz( ol)?)|sesi? kapat|kapat sesi?", t):
         return {"say": "", "actions": [act("volume", direction="mute")]}
     if re.fullmatch(r"(sesi )?(aç|geri aç)", t) and "ses" in t:
         return {"say": "", "actions": [act("volume", direction="unmute")]}
@@ -109,7 +116,7 @@ def fast_path(text: str) -> dict | None:
         return {"say": "", "actions": [act("nav", key="home")]}
     if re.fullmatch(r"(geri dön|geri git)", t):
         return {"say": "", "actions": [act("nav", key="back")]}
-    if re.fullmatch(r"(tv(yi)?|televizyonu?|kutuyu?) (kapat|uyut)|uyku moduna (geç|al)", t):
+    if SLEEP_RE.fullmatch(t):
         return {"say": "İyi geceler.", "actions": [act("sleep")]}
     m = re.fullmatch(r"youtube ?(da|ta|de|te) (.+?) (aç|ara|bul|oynat|izle|göster|çal)", t)
     if m:
@@ -131,6 +138,7 @@ Kurallar:
 - Cevaplar sesli okunur: en fazla 2 kısa cümle, liste, emoji, markdown yok.
 - İşlem için onay cümlesi gerekmez; `say` boş bırakılabilir. Belirsizse en olası işlemi yap.
 - Uygulama açarken yalnızca aşağıdaki listedeki paket adlarını kullan. Listede yoksa bunu söyle.
+- TV'yi, televizyonu, kutuyu, box'ı, Android'i kapatma ya da beklemeye/uyku moduna alma istekleri `sleep` işlemidir.
 - Dizi/film/müzik/video istekleri YouTube'da aranır (youtube_search), kullanıcı başka uygulama demediyse.
 
 Kurulu uygulamalar (etiket: paket):
@@ -243,8 +251,10 @@ def run_server_side(actions: list[dict]) -> list[dict]:
     rest = []
     for a in actions:
         if a["type"] == "sleep":
-            subprocess.Popen(["adb", "-s", BOX, "shell", "input", "keyevent", "KEYCODE_SLEEP"],
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            # Kısa bekleme: kutu uyumadan önce "İyi geceler" sesli okunabilsin.
+            threading.Timer(4.0, lambda: subprocess.Popen(
+                ["adb", "-s", BOX, "shell", "input", "keyevent", "KEYCODE_SLEEP"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)).start()
         else:
             rest.append(a)
     return rest
