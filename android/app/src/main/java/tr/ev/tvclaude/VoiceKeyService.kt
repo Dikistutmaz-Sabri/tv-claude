@@ -7,7 +7,10 @@ import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.drawable.GradientDrawable
+import android.media.AudioAttributes
+import android.media.AudioFocusRequest
 import android.media.AudioManager
+import android.media.MediaPlayer
 import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
@@ -41,6 +44,10 @@ class VoiceKeyService : AccessibilityService() {
     private var ttsReady = false
     private var overlay: TextView? = null
     private var listening = false
+    private var waiting = false
+    private var generation = 0
+    private var player: MediaPlayer? = null
+    private var focus: AudioFocusRequest? = null
     private var serverUrl = "http://192.168.1.55:8790"
     private var token = ""
     private var triggerKey = KeyEvent.KEYCODE_F8
@@ -76,14 +83,34 @@ class VoiceKeyService : AccessibilityService() {
     override fun onKeyEvent(event: KeyEvent): Boolean {
         if (event.keyCode != triggerKey) return false
         if (event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0) {
-            main.post { if (listening) cancelListening() else startListening() }
+            main.post { onTrigger() }
         }
         return true
     }
 
+    // Tuş: konuşuyorsa sustur, yanıt bekliyorsa iptal et, dinliyorsa dinlemeyi kes, yoksa dinlemeye başla.
+    private fun onTrigger() {
+        when {
+            isSpeaking() -> { stopSpeaking(); hideOverlay() }
+            waiting -> { generation++; waiting = false; hideOverlay() }
+            listening -> cancelListening()
+            else -> startListening()
+        }
+    }
+
+    private fun isSpeaking() = player != null || tts?.isSpeaking == true
+
+    private fun stopSpeaking() {
+        generation++
+        tts?.stop()
+        player?.let { runCatching { it.stop() }; it.release() }
+        player = null
+        releaseFocus()
+    }
+
     private fun startListening() {
         loadConfig()
-        tts?.stop()
+        stopSpeaking()
         val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
             putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
             putExtra(RecognizerIntent.EXTRA_LANGUAGE, "tr-TR")
@@ -132,7 +159,9 @@ class VoiceKeyService : AccessibilityService() {
                 finish("Seni duyamadım.")
             } else {
                 showOverlay("⏳  $text")
-                io.execute { ask(text) }
+                waiting = true
+                val gen = ++generation
+                io.execute { ask(text, gen) }
             }
         }
 
@@ -150,7 +179,7 @@ class VoiceKeyService : AccessibilityService() {
         }
     }
 
-    private fun ask(text: String) {
+    private fun ask(text: String, gen: Int) {
         val t0 = SystemClock.elapsedRealtime()
         val reply = runCatching {
             post("/ask", JSONObject().put("text", text))
@@ -160,6 +189,8 @@ class VoiceKeyService : AccessibilityService() {
         }
         Log.i(TAG, "sunucu ${SystemClock.elapsedRealtime() - t0}ms: $reply")
         main.post {
+            if (gen != generation) return@post
+            waiting = false
             if (reply == null) {
                 finish("Sunucuya ulaşamadım.")
                 return@post
@@ -188,6 +219,78 @@ class VoiceKeyService : AccessibilityService() {
         } finally {
             conn.disconnect()
         }
+    }
+
+    // Pi'deki Piper sesinden wav alır; ulaşılamazsa null döner ve kutunun kendi sesi kullanılır.
+    private fun fetchSpeech(say: String): File? = runCatching {
+        val conn = URL("$serverUrl/tts").openConnection() as HttpURLConnection
+        try {
+            conn.requestMethod = "POST"
+            conn.connectTimeout = 2000
+            conn.readTimeout = 15000
+            conn.doOutput = true
+            conn.setRequestProperty("Content-Type", "application/json; charset=utf-8")
+            conn.setRequestProperty("X-Token", token)
+            conn.outputStream.use { it.write(JSONObject().put("text", say).toString().toByteArray()) }
+            if (conn.responseCode != 200) error("HTTP ${conn.responseCode}")
+            val f = File(cacheDir, "say.wav")
+            conn.inputStream.use { input -> f.outputStream().use { input.copyTo(it) } }
+            f
+        } finally {
+            conn.disconnect()
+        }
+    }.onFailure { Log.w(TAG, "sunucu sesi alınamadı", it) }.getOrNull()
+
+    private fun speak(say: String) {
+        val gen = generation
+        io.execute {
+            val t0 = SystemClock.elapsedRealtime()
+            val wav = fetchSpeech(say)
+            Log.i(TAG, "ses ${SystemClock.elapsedRealtime() - t0}ms")
+            main.post {
+                if (gen != generation) return@post
+                if (wav == null || !play(wav)) {
+                    if (ttsReady) tts?.speak(say, TextToSpeech.QUEUE_FLUSH, null, "say")
+                    main.postDelayed({ if (!listening && !waiting && !isSpeaking()) hideOverlay() }, 3500)
+                }
+            }
+        }
+    }
+
+    private fun play(wav: File): Boolean = runCatching {
+        val attrs = AudioAttributes.Builder()
+            .setUsage(AudioAttributes.USAGE_ASSISTANT)
+            .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+            .build()
+        val audio = getSystemService(AUDIO_SERVICE) as AudioManager
+        focus = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
+            .setAudioAttributes(attrs).build().also { audio.requestAudioFocus(it) }
+        player = MediaPlayer().apply {
+            setAudioAttributes(attrs)
+            setDataSource(wav.path)
+            setOnCompletionListener { done(it) }
+            setOnErrorListener { mp, _, _ -> done(mp); true }
+            prepare()
+            start()
+        }
+        true
+    }.onFailure {
+        Log.e(TAG, "ses çalınamadı", it)
+        player?.release()
+        player = null
+        releaseFocus()
+    }.getOrDefault(false)
+
+    private fun done(mp: MediaPlayer) {
+        mp.release()
+        if (player === mp) player = null
+        releaseFocus()
+        main.postDelayed({ if (!listening && !waiting && !isSpeaking()) hideOverlay() }, 1200)
+    }
+
+    private fun releaseFocus() {
+        focus?.let { (getSystemService(AUDIO_SERVICE) as AudioManager).abandonAudioFocusRequest(it) }
+        focus = null
     }
 
     private fun sendApps() {
@@ -273,8 +376,7 @@ class VoiceKeyService : AccessibilityService() {
             return
         }
         showOverlay(say)
-        if (ttsReady) tts?.speak(say, TextToSpeech.QUEUE_FLUSH, null, "say")
-        main.postDelayed({ if (!listening) hideOverlay() }, 3500)
+        speak(say)
     }
 
     private fun showOverlay(text: String) {
@@ -317,6 +419,7 @@ class VoiceKeyService : AccessibilityService() {
     }
 
     override fun onDestroy() {
+        stopSpeaking()
         hideOverlay()
         recognizer?.destroy()
         tts?.shutdown()

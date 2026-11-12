@@ -5,6 +5,8 @@ import re
 import subprocess
 import threading
 import time
+import tempfile
+from collections import OrderedDict
 from datetime import date
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -20,6 +22,8 @@ MODEL = os.environ.get("TV_CLAUDE_MODEL", "claude-haiku-5-5")
 DAILY_TOKEN_LIMIT = int(os.environ.get("TV_CLAUDE_DAILY_TOKENS", "300000"))
 APPS_FILE = BASE / "apps.json"
 USAGE_FILE = BASE / "usage.jsonl"
+PIPER_DIR = Path(os.environ.get("TV_CLAUDE_PIPER", "/home/dietpi/apps/piper"))
+VOICE = os.environ.get("TV_CLAUDE_VOICE", "tr_TR-99eren99")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("tv-claude")
@@ -246,6 +250,57 @@ def run_server_side(actions: list[dict]) -> list[dict]:
     return rest
 
 
+class Piper:
+    """Ses modelini bellekte tutan kalıcı Piper süreci; her satır bir wav dosyası üretir."""
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.proc: subprocess.Popen | None = None
+        self.out = Path(tempfile.mkdtemp(prefix="tv-claude-tts-"))
+        self.cache: OrderedDict[str, bytes] = OrderedDict()
+
+    def _start(self) -> subprocess.Popen:
+        if self.proc is None or self.proc.poll() is not None:
+            model = PIPER_DIR / "voices" / f"{VOICE}.onnx"
+            self.proc = subprocess.Popen(
+                [str(PIPER_DIR / "piper" / "piper"), "-m", str(model), "--output_dir", str(self.out), "-q"],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1,
+            )
+            log.info("piper başladı (%s)", VOICE)
+        return self.proc
+
+    def wav(self, text: str) -> bytes | None:
+        text = " ".join(text.split())[:400]
+        if not text:
+            return None
+        with self.lock:
+            if text in self.cache:
+                self.cache.move_to_end(text)
+                return self.cache[text]
+            started = time.monotonic()
+            try:
+                proc = self._start()
+                proc.stdin.write(text + "\n")
+                proc.stdin.flush()
+                path = Path(proc.stdout.readline().strip())
+                data = path.read_bytes()
+                path.unlink(missing_ok=True)
+            except (OSError, ValueError) as e:
+                log.warning("piper hatası: %s", e)
+                if self.proc:
+                    self.proc.kill()
+                self.proc = None
+                return None
+            log.info("ses %dms, %d KB: %s", int((time.monotonic() - started) * 1000), len(data) // 1024, text[:60])
+            self.cache[text] = data
+            if len(self.cache) > 40:
+                self.cache.popitem(last=False)
+            return data
+
+
+piper = Piper()
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -291,6 +346,16 @@ class Handler(BaseHTTPRequestHandler):
             result["actions"] = run_server_side(result["actions"])
             log.info("%s [%s] %dms: %s", source, text, int((time.monotonic() - started) * 1000), result)
             return self.reply(200, result)
+        if self.path == "/tts":
+            data = piper.wav(str(body.get("text", "")))
+            if data is None:
+                return self.reply(503, {})
+            self.send_response(200)
+            self.send_header("Content-Type", "audio/wav")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return
         self.reply(404, {})
 
 
@@ -307,5 +372,6 @@ def warm_up() -> None:
 
 if __name__ == "__main__":
     threading.Thread(target=warm_up, daemon=True).start()
+    threading.Thread(target=lambda: [piper.wav(t) for t in ("Seni duyamadım.", "Tamam.")], daemon=True).start()
     log.info("dinleniyor :%d", PORT)
     ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
